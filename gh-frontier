@@ -1,0 +1,455 @@
+#!/usr/bin/env -S uv run --script
+# -*- coding: utf-8 -*-
+# Docs: Context7 /websites/github_en_graphql — ctx7 docs /websites/github_en_graphql "Issue blockedBy blocking"
+# Docs: Context7 /websites/cli_github_manual — ctx7 docs /websites/cli_github_manual "gh extension"
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""gh-frontier — the next issue to work, by dependency frontier.
+
+A `gh` extension that lists a repository's open issues in dependency-aware
+order using GitHub's native issue dependencies ("blocked by"), with priority
+labels. One paginated GraphQL query fetches everything; no per-issue calls.
+
+The repo rule (docs/agents/issue-tracker.md): the next issue is an open issue
+labelled ready-for-agent with no open blocker, highest priority first
+(P0..P3; an issue with no priority label counts as P2), then lowest number.
+
+Examples:
+  gh frontier next --repo Thedougler/avtt -n 10
+  gh frontier next --priority P0 --json
+  gh frontier order --exclude-label needs-info
+  gh frontier show 780
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+EXIT_OK = 0
+EXIT_RUNTIME = 1
+EXIT_USAGE = 2
+EXIT_NOT_FOUND = 3
+EXIT_CYCLE = 4
+
+QUERY = """\
+query($owner:String!,$name:String!,$endCursor:String,$labels:[String!]){
+ repository(owner:$owner,name:$name){
+  issues(states:OPEN,first:100,after:$endCursor,labels:$labels){
+   pageInfo{hasNextPage endCursor}
+   nodes{ number title url createdAt updatedAt
+    labels(first:30){nodes{name}}
+    assignees(first:10){nodes{login}}
+    blockedBy(first:50){nodes{number state}}
+    blocking(first:50){nodes{number state}}
+    parent{number}
+   }}}}
+"""
+
+DEFAULT_PRIORITY_LABELS = ["P0", "P1", "P2", "P3"]
+DEFAULT_LABEL = "ready-for-agent"
+DEFAULT_SORT = "priority,number"
+SORT_KEYS = ("priority", "number", "oldest", "newest", "updated", "unblocks", "depth")
+
+
+class CliError(Exception):
+    def __init__(self, message, fix, exit_code=EXIT_RUNTIME):
+        super().__init__(message)
+        self.fix = fix
+        self.exit_code = exit_code
+
+
+def run_gh(args):
+    gh = os.environ.get("GH_PATH", "gh")
+    try:
+        proc = subprocess.run([gh, *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise CliError("gh not found on PATH", "Install the GitHub CLI: https://cli.github.com/")
+    if proc.returncode != 0:
+        detail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "unknown gh error"
+        hint = "Check authentication with `gh auth status`, or pass the repository explicitly: gh frontier next --repo OWNER/NAME"
+        if "not a git repository" in detail:
+            raise CliError("could not determine the repository", hint)
+        raise CliError(f"gh failed: {detail}", hint)
+    return proc.stdout
+
+
+def fetch_issues(owner, name, server_labels):
+    """Fetch all open issues in one paginated GraphQL query."""
+    out = run_gh([
+        "api", "graphql", "--paginate",
+        "-F", f"owner={owner}", "-F", f"name={name}",
+    ] + [f"-F labels[]={lab}" for lab in server_labels] + ["-f", f"query={QUERY}"])
+    decoder = json.JSONDecoder()
+    nodes, i, text = [], 0, out
+    while i < len(text):
+        while i < len(text) and text[i].isspace():
+            i += 1
+        if i >= len(text):
+            break
+        page, i = decoder.raw_decode(text, i)
+        repo = (page.get("data") or {}).get("repository")
+        if repo is None:
+            raise CliError("repository not found", "Pass --repo owner/name or run inside a clone of the repository.")
+        nodes.extend(repo["issues"]["nodes"])
+    return nodes
+
+
+def normalize(nodes, priority_labels, default_priority):
+    issues = {}
+    for n in nodes:
+        labels = [l["name"] for l in n["labels"]["nodes"]]
+        rank = None
+        for lab in priority_labels:
+            if lab in labels:
+                rank = priority_labels.index(lab)
+                break
+        if rank is None:
+            rank = priority_labels.index(default_priority) if default_priority in priority_labels else len(priority_labels)
+        issues[n["number"]] = {
+            "number": n["number"],
+            "title": n["title"],
+            "url": n.get("url"),
+            "created_at": n["createdAt"],
+            "updated_at": n["updatedAt"],
+            "labels": labels,
+            "assignees": [a["login"] for a in n["assignees"]["nodes"]],
+            "priority": priority_labels[rank] if rank is not None else default_priority,
+            "priority_rank": rank if rank is not None else len(priority_labels),
+            "blocked_by_open": [b["number"] for b in n["blockedBy"]["nodes"] if b["state"] == "OPEN"],
+            "blocked_by_closed": [b["number"] for b in n["blockedBy"]["nodes"] if b["state"] != "OPEN"],
+            "blocks": [],
+            "parent": n["parent"]["number"] if n.get("parent") else None,
+        }
+    for iss in issues.values():
+        for b in iss["blocked_by_open"]:
+            if b in issues:
+                issues[b]["blocks"].append(iss["number"])
+    return issues
+
+
+def compute_stats(issues):
+    """Depth (longest open-blocker chain) and unblocks (transitive downstream count)."""
+    depths = {}
+
+    def depth_of(n, seen):
+        if n in depths:
+            return depths[n]
+        if n in seen:
+            return 0  # cycle part; cycle detection handles reporting
+        seen.add(n)
+        d = 1 + max((depth_of(b, seen) for b in issues[n]["blocked_by_open"] if b in issues), default=-1)
+        depths[n] = d
+        return d
+
+    unblocks = {}
+    for num in issues:
+        seen, stack = set(), [num]
+        while stack:
+            cur = stack.pop()
+            for down in issues[cur]["blocks"]:
+                if down not in seen:
+                    seen.add(down)
+                    stack.append(down)
+        unblocks[num] = len(seen)
+    for num in issues:
+        depth_of(num, set())
+    for iss in issues.values():
+        iss["depth"] = depths[iss["number"]]
+        iss["unblocks"] = unblocks[iss["number"]]
+    return issues
+
+
+def sort_key(keys, priority_labels):
+    def key(iss):
+        parts = []
+        for k in keys:
+            if k == "priority":
+                parts.append(iss["priority_rank"])
+            elif k in ("number", "oldest"):
+                parts.append(iss["number"])
+            elif k == "newest":
+                parts.append(-iss["number"])  # newer issues have higher numbers
+            elif k == "updated":
+                parts.append(iss["updated_at"])
+                # descending: handled by tuple negation impossible for str; use reverse trick below
+            elif k == "unblocks":
+                parts.append(-iss["unblocks"])
+            elif k == "depth":
+                parts.append(iss["depth"])
+        parts.append(iss["number"])
+        return parts
+    return key
+
+
+def order_issues(issues, keys, priority_labels):
+    """Stable multi-key sort; final tiebreak always number ascending."""
+    iss_list = list(issues.values())
+    # Apply keys in reverse order with stable sorts; 'updated' and 'newest' need descending.
+    for k in reversed(keys):
+        if k == "updated":
+            iss_list.sort(key=lambda i: i["updated_at"], reverse=True)
+        elif k == "newest":
+            iss_list.sort(key=lambda i: i["created_at"], reverse=True)
+        elif k == "priority":
+            iss_list.sort(key=lambda i: i["priority_rank"])
+        elif k in ("number", "oldest"):
+            iss_list.sort(key=lambda i: i["number"])
+        elif k == "unblocks":
+            iss_list.sort(key=lambda i: i["unblocks"], reverse=True)
+        elif k == "depth":
+            iss_list.sort(key=lambda i: i["depth"])
+        else:
+            raise CliError(f"unknown sort key: {k}", f"Use one of: {', '.join(SORT_KEYS)}")
+    return iss_list
+
+
+def matches(iss, labels, exclude_labels, unassigned, priorities):
+    if not all(l in iss["labels"] for l in labels):
+        return False
+    if any(l in iss["labels"] for l in exclude_labels):
+        return False
+    if unassigned and iss["assignees"]:
+        return False
+    if priorities and iss["priority"] not in priorities:
+        return False
+    return True
+
+
+def topological_order(issues, key):
+    """Kahn's algorithm over blocked_by edges among the given issues (dict or list)."""
+    by_num = {i["number"]: i for i in issues}
+    ids = set(by_num)
+    indeg = {n: 0 for n in ids}
+    downstream = {n: [] for n in ids}
+    for iss in by_num.values():
+        for b in iss["blocked_by_open"]:
+            if b in ids:
+                indeg[iss["number"]] += 1
+                downstream[b].append(iss["number"])
+    import heapq
+    heap = [(key(i), i["number"]) for i in by_num.values() if indeg[i["number"]] == 0]
+    heapq.heapify(heap)
+    out = []
+    while heap:
+        _, n = heapq.heappop(heap)
+        out.append(n)
+        for d in downstream[n]:
+            indeg[d] -= 1
+            if indeg[d] == 0:
+                heapq.heappush(heap, (key(by_num[d]), d))
+    if len(out) != len(ids):
+        remaining = ids - set(out)
+        cycle = find_cycle(by_num, remaining)
+        chain = " -> ".join(f"#{n}" for n in cycle)
+        raise CliError(
+            f"dependency cycle detected: {chain}",
+            f"Break the cycle by closing or unlinking one edge, e.g. `gh issue edit {cycle[0]} --remove-blocked-by <blocker>`.",
+            EXIT_CYCLE,
+        )
+    return out
+
+
+def find_cycle(issues, ids):
+    """Return one cycle path within ids, iterative DFS."""
+    ids = set(ids)
+    state, parent = {}, {}
+    for start in sorted(ids):
+        if start in state:
+            continue
+        stack = [(start, iter(sorted(b for b in issues[start]["blocked_by_open"] if b in ids)))]
+        state[start] = 1
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nxt in it:
+                if state.get(nxt) == 1:
+                    path, found = [], False
+                    for n, _ in reversed(stack):
+                        path.append(n)
+                        if n == nxt:
+                            found = True
+                            break
+                    path.reverse()
+                    if found:
+                        return path
+                elif nxt not in state:
+                    state[nxt] = 1
+                    parent[nxt] = node
+                    stack.append((nxt, iter(sorted(b for b in issues[nxt]["blocked_by_open"] if b in ids))))
+                    advanced = True
+                    break
+            if not advanced:
+                state[node] = 2
+                stack.pop()
+    return sorted(ids)  # fallback; should not happen
+
+
+def parse_sort(spec):
+    keys = [k.strip() for k in spec.split(",") if k.strip()]
+    for k in keys:
+        if k not in SORT_KEYS:
+            raise CliError(f"unknown sort key: {k}", f"Use keys from: {', '.join(SORT_KEYS)} (e.g. --sort priority,number)", EXIT_USAGE)
+    return keys or DEFAULT_SORT.split(",")
+
+
+def output_records(records, as_json, limit, show_all, cmd):
+    if as_json:
+        sliced = records if show_all else records[:limit]
+        print(json.dumps(sliced, indent=2))
+        if not show_all and len(records) > limit:
+            print(f"# {len(records) - limit} more omitted; use --all or --limit N", file=sys.stderr)
+    else:
+        sliced = records if show_all else records[:limit]
+        for iss in sliced:
+            print(f"#{iss['number']} {iss['priority']} [blocks {iss['unblocks']}] {iss['title']}")
+        if not show_all and len(records) > limit:
+            print(f"# … {len(records) - limit} more omitted; use --all or --limit N", file=sys.stderr)
+    if cmd == "next" and not records:
+        print("No unblocked issues match; try `--all`, a different --label, or `gh frontier order`.", file=sys.stderr)
+
+
+def add_common_filters(p, default_label=True):
+    p.add_argument("--label", action="append", default=[] if not default_label else None,
+                   help="filter by label; repeatable, ANDed (default: ready-for-agent)")
+    p.add_argument("--exclude-label", action="append", default=[], metavar="LABEL")
+    p.add_argument("--unassigned", action="store_true", help="only issues with no assignee")
+    p.add_argument("--priority", action="append", default=[], metavar="Px",
+                   help="filter by priority label; repeatable")
+    p.add_argument("--priority-labels", default=",".join(DEFAULT_PRIORITY_LABELS),
+                   help=f"priority labels in rank order (default: {','.join(DEFAULT_PRIORITY_LABELS)})")
+    p.add_argument("--default-priority", default="P2", metavar="Px",
+                   help="priority for issues with none (default: P2)")
+    p.add_argument("--sort", default=DEFAULT_SORT, help=f"comma list of: {', '.join(SORT_KEYS)} (default: {DEFAULT_SORT})")
+    p.add_argument("--repo", metavar="OWNER/NAME", help="repository (default: current repo)")
+    p.add_argument("--json", action="store_true", help="machine-readable JSON array")
+    p.add_argument("--limit", "-n", type=int, default=20, metavar="N", help="max records shown (default: 20)")
+    p.add_argument("--all", action="store_true", help="show all records, ignoring --limit")
+
+
+def resolve_repo(args):
+    if args.repo:
+        if "/" not in args.repo:
+            raise CliError(f"invalid --repo value: {args.repo}", "Use the OWNER/NAME form, e.g. --repo Thedougler/avtt", EXIT_USAGE)
+        return args.repo.split("/", 1)
+    out = run_gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+    owner, _, name = out.strip().partition("/")
+    return owner, name
+
+
+def build(args, cmd):
+    owner, name = resolve_repo(args)
+    priority_labels = [l.strip() for l in args.priority_labels.split(",") if l.strip()]
+    if not priority_labels:
+        raise CliError("--priority-labels is empty", "Pass at least one label, e.g. --priority-labels P0,P1,P2,P3", EXIT_USAGE)
+    default_priority = args.default_priority
+    if default_priority not in priority_labels:
+        priority_labels.append(default_priority)
+    keys = parse_sort(args.sort)
+
+    server_labels = args.label if args.label is not None else ([DEFAULT_LABEL] if cmd == "next" else [])
+    nodes = fetch_issues(owner, name, server_labels)
+    issues = compute_stats(normalize(nodes, priority_labels, default_priority))
+
+    labels = args.label if args.label is not None else ([DEFAULT_LABEL] if cmd == "next" else [])
+    sel = {n: i for n, i in issues.items() if matches(i, labels, args.exclude_label, args.unassigned, args.priority)}
+    return issues, sel, keys
+
+
+def cmd_next(args):
+    issues, sel, keys = build(args, "next")
+    records = [i for i in order_issues(sel, keys, []) if not i["blocked_by_open"]]
+    output_records(records, args.json, args.limit, args.all, "next")
+    return EXIT_OK
+
+
+def cmd_order(args):
+    issues, sel, keys = build(args, "order")
+    ordered = topological_order(list(sel.values()), sort_key(keys, []))
+    by_num = issues
+    records = [by_num[n] for n in ordered]
+    output_records(records, args.json, args.limit, args.all, "order")
+    return EXIT_OK
+
+
+def cmd_show(args):
+    owner, name = resolve_repo(args)
+    priority_labels = [l.strip() for l in args.priority_labels.split(",") if l.strip()] or list(DEFAULT_PRIORITY_LABELS)
+    nodes = fetch_issues(owner, name, [])
+    issues = compute_stats(normalize(nodes, priority_labels, args.default_priority))
+    num = args.number
+    if num not in issues:
+        raise CliError(f"issue #{num} not found among open issues", f"Try `gh issue view {num}` — it may be closed.", EXIT_NOT_FOUND)
+    iss = issues[num]
+    if args.json:
+        print(json.dumps(iss, indent=2))
+        return EXIT_OK
+    print(f"#{num} {iss['priority']} {iss['title']}")
+    print(f"  url:      {iss['url']}")
+    print(f"  labels:   {', '.join(iss['labels']) or '(none)'}")
+    print(f"  assignees:{' ' + ', '.join(iss['assignees']) if iss['assignees'] else ' (none)'}")
+    print(f"  depth:    {iss['depth']}   unblocks: {iss['unblocks']}")
+    if iss["blocked_by_open"]:
+        print("  blocked by (open):   " + ", ".join(f"#{b}" for b in sorted(iss["blocked_by_open"])))
+    else:
+        print("  blocked by (open):   none — on the frontier")
+    if iss["blocked_by_closed"]:
+        print("  blocked by (closed): " + ", ".join(f"#{b}" for b in sorted(iss["blocked_by_closed"])))
+    if iss["blocks"]:
+        print("  blocks (open):       " + ", ".join(f"#{b}" for b in sorted(iss["blocks"])))
+    else:
+        print("  blocks (open):       nothing")
+    return EXIT_OK
+
+
+def epilog_examples(cmd):
+    return {
+        "next": "Examples:\n  gh frontier next --repo Thedougler/avtt -n 10\n  gh frontier next --priority P0 --json\n  gh frontier next --label ready-for-agent --unassigned --sort unblocks,number",
+        "order": "Examples:\n  gh frontier order\n  gh frontier order --json --all\n  gh frontier order --exclude-label needs-info",
+        "show": "Examples:\n  gh frontier show 780\n  gh frontier show 991 --json",
+    }[cmd]
+
+
+def make_parser():
+    parser = argparse.ArgumentParser(prog="gh frontier", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command")
+    for name, fn, help_ in (
+        ("next", cmd_next, "unblocked issues, repo rule order (priority, then number)"),
+        ("order", cmd_order, "all matching issues in topological blocked-by order"),
+        ("show", cmd_show, "one issue's blockers, blocks, depth and unblocks"),
+    ):
+        p = sub.add_parser(name, help=help_, description=help_,
+                           formatter_class=argparse.RawDescriptionHelpFormatter,
+                           epilog=epilog_examples(name))
+        if name == "show":
+            p.add_argument("number", type=int, metavar="N", help="issue number")
+            p.add_argument("--repo", metavar="OWNER/NAME", help="repository (default: current repo)")
+            p.add_argument("--json", action="store_true")
+            p.add_argument("--priority-labels", default=",".join(DEFAULT_PRIORITY_LABELS))
+            p.add_argument("--default-priority", default="P2")
+        else:
+            add_common_filters(p)
+        p.set_defaults(func=fn)
+    return parser
+
+
+def main(argv=None):
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return EXIT_USAGE
+    try:
+        return args.func(args)
+    except CliError as e:
+        print(f"error: {e.message if hasattr(e, 'message') else e}", file=sys.stderr)
+        print(f"fix: {e.fix}", file=sys.stderr)
+        return e.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
