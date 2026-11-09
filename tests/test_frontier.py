@@ -47,6 +47,14 @@ def test_priority_then_number_order(issues):
     got = [i["number"] for i in gf.order_issues(sel(issues, labels=["ready"]), gf.parse_sort("priority,number"), [])]
     assert got == [1, 2, 7, 4, 3, 5, 6]  # 8-12 lack the ready label
 
+def test_per_tier_keeps_the_oldest_of_each_tier_and_counts_the_rest():
+    records = [{"number": n, "priority": p} for n, p in
+               [(1, "P0"), (4, "P0"), (9, "P0"), (2, "P1"), (3, "P2"), (5, "P2"), (8, "P2")]]
+    kept, omitted = gf.per_tier(records, 2)
+    assert [r["number"] for r in kept] == [1, 4, 2, 3, 5]
+    assert omitted == {"P0": 1, "P2": 1}
+
+
 
 def test_default_priority_p2(issues):
     assert issues[3]["priority"] == "P2"

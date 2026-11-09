@@ -17,15 +17,19 @@ Requires `gh` ≥ 2.94 (native issue dependencies) and an authenticated `gh`.
 ## Usage
 
 ```sh
-gh frontier next --repo Thedougler/avtt -n 10   # the next 10 unblocked ready-for-agent issues
+gh frontier next                               # top 10 of each priority tier, oldest first
+gh frontier next --repo Thedougler/avtt -n 10   # one flat list: the next 10 unblocked ready-for-agent issues
 gh frontier next --priority P0 --json           # machine-readable P0 frontier
 gh frontier order --exclude-label needs-info    # all matching issues, topological blocked-by order
 gh frontier show 780                            # one issue's blockers, blocks, depth, unblocks
 ```
 
-`next` — open issues with **no open blocker**, in the repo's rule order:
-highest priority first (`P0`…`P3`; an issue with no priority label counts as
-`P2`), then lowest number. Default label `ready-for-agent`.
+`next` — open issues with **no open blocker**, backlog first: highest priority
+first (`P0`…`P3`; an issue with no priority label counts as `P2`), then oldest
+(lowest number), so older work in a tier always comes before newer work of the
+same priority. By default it shows the top 10 of **each** priority tier
+(`--per-tier N`); `--limit N` gives one flat list instead. Default label
+`ready-for-agent`.
 
 `order` — all matching issues, blocked ones included, in topological order of
 the blocked-by edges; ties broken by `--sort`. Dependency cycles are an error
@@ -47,7 +51,8 @@ the blocked-by edges; ties broken by `--sort`. Dependency cycles are an error
 | `--sort KEYS` | Comma list, applied in order: `priority`, `number`/`oldest`, `newest`, `updated`, `unblocks` (transitive downstream count, desc), `depth` (blocker-chain length). Default `priority,number`. |
 | `--repo OWNER/NAME` | Repository; defaults to the current repo like `gh`. |
 | `--json` | Stable JSON array (`number`, `title`, `priority`, `labels`, `assignees`, `blocked_by_open`, `blocked_by_closed`, `blocks`, `unblocks`, `depth`, `created_at`, `updated_at`, `parent`, `url`). |
-| `--limit N` / `-n` / `--all` | Output is bounded at 20 by default; the trailer line names the flag to see all. |
+| `--per-tier N` | `next` only: records per priority tier when no `--limit` is given (default 10). |
+| `--limit N` / `-n` / `--all` | One flat list of N (`order` defaults to 20); `--all` shows everything. Trailer lines on stderr name the flag to see more. |
 
 ### Exit codes
 

@@ -326,8 +326,9 @@ def add_common_filters(p, default_label=True):
     p.add_argument("--sort", default=DEFAULT_SORT, help=f"comma list of: {', '.join(SORT_KEYS)} (default: {DEFAULT_SORT})")
     p.add_argument("--repo", metavar="OWNER/NAME", help="repository (default: current repo)")
     p.add_argument("--json", action="store_true", help="machine-readable JSON array")
-    p.add_argument("--limit", "-n", type=int, default=20, metavar="N", help="max records shown (default: 20)")
-    p.add_argument("--all", action="store_true", help="show all records, ignoring --limit")
+    p.add_argument("--limit", "-n", type=int, default=None, metavar="N",
+                   help="max records shown, one flat list (default: 20; `next` defaults to --per-tier)")
+    p.add_argument("--all", action="store_true", help="show all records, ignoring --limit and --per-tier")
 
 
 def resolve_repo(args):
@@ -359,10 +360,30 @@ def build(args, cmd):
     return issues, sel, keys
 
 
+def per_tier(records, n):
+    """The first `n` of each priority tier, tiers in the order they appear; plus what each dropped."""
+    kept, omitted, seen = [], {}, {}
+    for iss in records:
+        tier = iss["priority"]
+        seen[tier] = seen.get(tier, 0) + 1
+        if seen[tier] <= n:
+            kept.append(iss)
+        else:
+            omitted[tier] = omitted.get(tier, 0) + 1
+    return kept, omitted
+
+
 def cmd_next(args):
     issues, sel, keys = build(args, "next")
     records = [i for i in order_issues(sel, keys, []) if not i["blocked_by_open"]]
-    output_records(records, args.json, args.limit, args.all, "next")
+    if args.all or args.limit is not None:
+        output_records(records, args.json, args.limit or 20, args.all, "next")
+        return EXIT_OK
+    # Default: the backlog of every tier, oldest first, `--per-tier` deep (10).
+    kept, omitted = per_tier(records, args.per_tier)
+    output_records(kept, args.json, len(kept), True, "next")
+    for tier, count in omitted.items():
+        print(f"# … {tier}: {count} more omitted; use --per-tier N, --priority {tier} --all, or --all", file=sys.stderr)
     return EXIT_OK
 
 
@@ -371,7 +392,7 @@ def cmd_order(args):
     ordered = topological_order(list(sel.values()), sort_key(keys, []))
     by_num = issues
     records = [by_num[n] for n in ordered]
-    output_records(records, args.json, args.limit, args.all, "order")
+    output_records(records, args.json, args.limit or 20, args.all, "order")
     return EXIT_OK
 
 
@@ -407,7 +428,7 @@ def cmd_show(args):
 
 def epilog_examples(cmd):
     return {
-        "next": "Examples:\n  gh frontier next --repo Thedougler/avtt -n 10\n  gh frontier next --priority P0 --json\n  gh frontier next --label ready-for-agent --unassigned --sort unblocks,number",
+        "next": "Examples:\n  gh frontier next                      # top 10 of each priority tier, oldest first\n  gh frontier next --per-tier 3\n  gh frontier next -n 10                # one flat list: the 10 to do next\n  gh frontier next --priority P0 --json\n  gh frontier next --label ready-for-agent --unassigned --sort unblocks,number",
         "order": "Examples:\n  gh frontier order\n  gh frontier order --json --all\n  gh frontier order --exclude-label needs-info",
         "show": "Examples:\n  gh frontier show 780\n  gh frontier show 991 --json",
     }[cmd]
@@ -418,7 +439,7 @@ def make_parser():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command")
     for name, fn, help_ in (
-        ("next", cmd_next, "unblocked issues, repo rule order (priority, then number)"),
+        ("next", cmd_next, "unblocked issues: the backlog first (priority, then oldest), top 10 per tier"),
         ("order", cmd_order, "all matching issues in topological blocked-by order"),
         ("show", cmd_show, "one issue's blockers, blocks, depth and unblocks"),
     ):
@@ -433,6 +454,9 @@ def make_parser():
             p.add_argument("--default-priority", default="P2")
         else:
             add_common_filters(p)
+            if name == "next":
+                p.add_argument("--per-tier", type=int, default=10, metavar="N",
+                               help="records shown per priority tier when no --limit is given (default: 10)")
         p.set_defaults(func=fn)
     return parser
 
